@@ -700,7 +700,7 @@ export async function saveMetricsHistory(db, serverId, historyPartitionId, metri
   }
 }
 
-export async function getLatestMetrics(db, serverId, server = null) {
+export async function getLatestMetrics(db, serverId, server = null, { strict = false } = {}) {
   try {
     const historyInfo = await getServerHistoryInfo(db, serverId, server);
     if (!historyInfo.partitionId) {
@@ -728,6 +728,7 @@ export async function getLatestMetrics(db, serverId, server = null) {
     `).bind(serverId).first();
     return result ? normalizeProbeMetricRow(result) : null;
   } catch (e) {
+    if (strict) throw e;
     console.error('获取最新指标数据失败:', e);
     return null;
   }

@@ -320,7 +320,7 @@ export default {
             points: DASHBOARD_LATENCY_WINDOW_POINTS,
             hours: DASHBOARD_LATENCY_WINDOW_HOURS
           }
-        });
+        }, { 'X-CFSM-Offline-Check': 'realtime-d1' });
       }},
       { method: 'GET', path: '/theme', handler: async () => {
         const themeResult = await handleTheme()
@@ -454,7 +454,7 @@ export default {
         debug('[Cron] 每周日0:00-0:05表轮换期间，跳过离线节点检测');
       } else {
         debug('[Cron] 开始执行离线节点检测');
-        await checkOfflineNodes(env.DB);
+        await checkOfflineNodes(env);
         debug('[Cron] 离线节点检测完成');
         debug('[Cron] 开始执行资源负载告警检测');
         await checkResourceAlerts(env);

@@ -1,4 +1,4 @@
-import { getLatestMetricsForAllServers } from '../database/schema.js';
+import { getLatestMetrics } from '../database/schema.js';
 import { clearServersListCache, getAllServers } from '../utils/cache.js';
 import {
   DEFAULT_NOTIFICATION_TEMPLATE,
@@ -19,6 +19,7 @@ import {
 } from '../utils/settings.js';
 import { detectBillingCycle, normalizeBillingCycle, renewExpireDateIfNeeded } from '../utils/serverBilling.js';
 import {
+  DASHBOARD_LATEST_REPORT_ID_CHUNK_SIZE,
   NOTIFICATION_MAX_RETRIES,
   NOTIFICATION_RETRY_DELAY_MS,
   RESOURCE_ALERT_EVALUATE_RULE_BATCH_SIZE,
@@ -814,17 +815,50 @@ export async function sendNotification(settings, msg, notificationContext = {}) 
   }
 }
 
-export async function checkOfflineNodes(db) {
+async function getRealtimeReportTimes(env, serverIds) {
+  const namespace = env.METRICS_BROADCASTER;
+  const stub = namespace.get(namespace.idFromName('global'));
+  const reportTimes = new Map();
+  for (let offset = 0; offset < serverIds.length; offset += DASHBOARD_LATEST_REPORT_ID_CHUNK_SIZE) {
+    const response = await stub.fetch('http://internal/latest-report-updates', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ serverIds: serverIds.slice(offset, offset + DASHBOARD_LATEST_REPORT_ID_CHUNK_SIZE) })
+    });
+    if (!response.ok) throw new Error(`Realtime heartbeat lookup returned HTTP ${response.status}`);
+    const { updates } = await response.json();
+    if (!Array.isArray(updates)) throw new Error('Realtime heartbeat lookup returned invalid data');
+    for (const { serverId, reportTs } of updates) {
+      if (Number.isFinite(reportTs) && reportTs > 0) reportTimes.set(String(serverId), reportTs);
+    }
+  }
+  return reportTimes;
+}
+
+export async function checkOfflineNodes(env) {
+  const db = env.DB;
   const siteSettings = await loadSiteSettings(db);
   const tgNotifyMinutes = getTgNotifyMinutes(siteSettings.tg_notify);
 
   if (tgNotifyMinutes === 0 || !hasNotificationTarget(siteSettings)) return;
 
   try {
-    const allServers = await getAllServers(db);
-    
-    const latestMetricsMap = await getLatestMetricsForAllServers(db);
-    
+    const servers = (await getAllServers(db)).filter(s => String(s.offline_notify_disabled) !== '1');
+    if (servers.length === 0) return;
+    const reportTimes = await getRealtimeReportTimes(env, servers.map(s => String(s.id)));
+    const cutoff = Date.now() - tgNotifyMinutes * 60 * 1000;
+    // A fresh receipt proves liveness even when the history write or read lags.
+    const readings = await Promise.allSettled(servers.map(async s => {
+      const reportTime = reportTimes.get(String(s.id)) || 0;
+      if (reportTime >= cutoff) return { lastReportTime: reportTime, isOffline: false };
+
+      const latest = await getLatestMetrics(db, s.id, s, { strict: true });
+      if (latest && !(Number(latest.timestamp) > 0)) throw new Error('Invalid history timestamp');
+      const lastReportTime = Math.max(reportTime, Number(latest?.timestamp) || 0);
+      const lastSeen = lastReportTime || Number(s.timestamp);
+      return { lastReportTime, isOffline: lastSeen < cutoff };
+    }));
+
     let alertState = {};
     const stateRes = await db.prepare(
       "SELECT value FROM settings WHERE key = 'alert_state'"
@@ -838,26 +872,21 @@ export async function checkOfflineNodes(db) {
       }
     }
 
-    const now = Date.now();
-    const offlineThreshold = tgNotifyMinutes * 60 * 1000;
     const offlineNodes = [];
     const recoveredNodes = [];
 
-    for (const s of allServers) {
-      if (s.offline_notify_disabled === '1') continue;
-
-      const latestMetrics = latestMetricsMap.get(s.id);
-      
-      let isOffline = true;
-      if (latestMetrics) {
-        const diff = now - latestMetrics.timestamp;
-        isOffline = diff > offlineThreshold;
+    for (const [index, reading] of readings.entries()) {
+      if (reading.status === 'rejected') {
+        // A failed history read is unknown. Preserve the last confirmed alert state.
+        console.warn('[Offline check] Failed to read node history:', reading.reason?.message);
+        continue;
       }
-
+      const s = servers[index];
+      const { isOffline, lastReportTime } = reading.value;
       if (isOffline && !alertState[s.id]) {
         offlineNodes.push({
           name: s.name,
-          lastReportTime: latestMetrics?.timestamp
+          lastReportTime: lastReportTime || undefined
         });
         alertState[s.id] = true;
       } else if (!isOffline && alertState[s.id]) {
