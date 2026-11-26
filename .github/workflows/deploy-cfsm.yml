@@ -1,0 +1,79 @@
+name: Deploy CF Server Monitor
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: cfsm-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.repository == 'ceigt/CF-Server-Monitor' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - run: npm ci --no-audit --no-fund
+      - run: npm run build:frontend
+
+      - name: Prepare the production D1 binding
+        env:
+          CFSM_D1_DATABASE_ID: ${{ secrets.CFSM_D1_DATABASE_ID }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+          from uuid import UUID
+
+          source = Path('wrangler.toml').read_text(encoding='utf-8')
+          config = tomllib.loads(source)
+          if config.get('name') != 'cf-server-monitor' or config.get('keep_vars') is not True:
+              raise SystemExit('Unexpected Worker name or variable retention policy')
+          database, = config['d1_databases']
+          if database.get('binding') != 'DB' or database.get('database_name') != 'server-monitor-db':
+              raise SystemExit('Unexpected D1 binding')
+          database_id = str(UUID(os.environ['CFSM_D1_DATABASE_ID']))
+          anchor = 'database_name = "server-monitor-db"'
+          if source.count(anchor) != 1 or 'database_id' in database:
+              raise SystemExit('Expected exactly one D1 binding without an ID')
+          Path('.cfsm-production.toml').write_text(
+              source.replace(anchor, anchor + f'\ndatabase_id = "{database_id}"'), encoding='utf-8')
+          PY
+
+      - name: Upload and deploy the Worker version
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CFSM_CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CFSM_CLOUDFLARE_API_TOKEN }}
+        run: |
+          : "${CLOUDFLARE_ACCOUNT_ID:?Missing Cloudflare account ID}"
+          : "${CLOUDFLARE_API_TOKEN:?Missing Worker deployment token}"
+          export WRANGLER_OUTPUT_FILE_PATH="$RUNNER_TEMP/cfsm-upload.jsonl"
+          npx --no-install wrangler versions upload --config .cfsm-production.toml \
+            --message "GitHub main $GITHUB_SHA"
+          version_id=$(jq -er 'select(.type == "version-upload") | .version_id' "$WRANGLER_OUTPUT_FILE_PATH")
+          unset WRANGLER_OUTPUT_FILE_PATH
+          npx --no-install wrangler versions deploy "$version_id@100%" --yes \
+            --config .cfsm-production.toml --message "GitHub main $GITHUB_SHA"
+
+      - name: Verify the production endpoint
+        run: |
+          curl --fail --silent --show-error --max-time 12 --retry 4 --retry-all-errors --user-agent 'Mozilla/5.0' \
+            https://status.openet.uk/api/config | jq -e '.version | type == "string" and length > 0'
+          curl --fail --silent --show-error --max-time 12 --retry 4 --retry-all-errors --user-agent 'Mozilla/5.0' \
+            https://status.openet.uk/__do/health | jq -e '.ok == true'
